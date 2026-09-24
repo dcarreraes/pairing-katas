@@ -22,8 +22,6 @@ export interface ReservationsListener {
   isActive(): boolean;
 }
 
-const MAX_PREVIOUS_STATUS_SIZE = 1000;
-
 /**
  * Create reservations listener.
  *
@@ -42,9 +40,6 @@ export function createReservationsListener(
   // Per-reservation deduplication: track individual reservation IDs already notified
   const processedReservations = new Set<string>();
   const processedOccupiedReservations = new Set<string>();
-
-  // Track previous status for detecting transitions to "occupied"
-  const previousStatus = new Map<string, string>();
 
   /**
    * Mark reservations as notified in CouchDB for cross-process deduplication.
@@ -69,24 +64,6 @@ export function createReservationsListener(
           `[Notifications] Could not mark ${docId} as notified: ${error}`,
         );
       }
-    }
-  }
-
-  /**
-   * Clean up previousStatus map if it exceeds the maximum size
-   */
-  function cleanupPreviousStatusIfNeeded(): void {
-    if (previousStatus.size > MAX_PREVIOUS_STATUS_SIZE) {
-      const keysToDelete = Array.from(previousStatus.keys()).slice(
-        0,
-        previousStatus.size - MAX_PREVIOUS_STATUS_SIZE / 2,
-      );
-      for (const key of keysToDelete) {
-        previousStatus.delete(key);
-      }
-      logger.debug(
-        `[Notifications] Cleaned up previousStatus map, new size: ${previousStatus.size}`,
-      );
     }
   }
 
@@ -162,6 +139,63 @@ export function createReservationsListener(
     }
   }
 
+  async function recoverOrphanReservations(): Promise<void> {
+    try {
+      // Recover scheduled reservations that failed to send email
+      const scheduledOrphans = await reservationsDb.find({
+        selector: {
+          type: "reservation",
+          status: "scheduled",
+          scheduledEmailSentAt: { $exists: false },
+        },
+      });
+
+      if (scheduledOrphans.docs.length > 0) {
+        logger.info(
+          `[Notifications] Recovering ${scheduledOrphans.docs.length} scheduled orphan(s)`,
+        );
+        for (const doc of scheduledOrphans.docs) {
+          try {
+            await handleScheduledReservation(doc);
+          } catch (err) {
+            logger.error(
+              `[Notifications] Failed to recover scheduled orphan: ${doc._id}`,
+              err,
+            );
+          }
+        }
+      }
+
+      // Recover occupied transitions that failed to send email
+      const occupiedOrphans = await reservationsDb.find({
+        selector: {
+          type: "reservation",
+          status: "occupied",
+          occupiedEmailSentAt: { $exists: false },
+        },
+      });
+
+      if (occupiedOrphans.docs.length > 0) {
+        logger.info(
+          `[Notifications] Recovering ${occupiedOrphans.docs.length} occupied orphan(s)`,
+        );
+        for (const doc of occupiedOrphans.docs) {
+          try {
+            await handleOccupiedTransition(doc);
+          } catch (err) {
+            logger.error(
+              `[Notifications] Failed to recover occupied orphan: ${doc._id}`,
+              err,
+            );
+          }
+        }
+      }
+    } catch (err) {
+      logger.error("[Notifications] Orphan recovery failed", err);
+      // Continue anyway: orphan recovery is best-effort
+    }
+  }
+
   async function start(): Promise<void> {
     if (isActive) {
       logger.warn("[Notifications] Reservations listener is already active");
@@ -178,10 +212,18 @@ export function createReservationsListener(
         `[Notifications] Connected to reservations database: ${info.db_name} (${info.doc_count} docs)`,
       );
 
-      // The changes-feed loop (checkpoint since update_seq, polling,
-      // design-doc skip, fault tolerance) is the shared
-      // createChangesFeedWorker primitive; this listener keeps the
-      // per-change processing.
+      // Recover any reservations that failed to send emails (orphans)
+      await recoverOrphanReservations();
+
+      // The changes-feed loop (checkpoint recovery, polling, design-doc skip,
+      // fault tolerance) is the shared createChangesFeedWorker primitive;
+      // this listener keeps the per-change processing.
+      //
+      // On first startup (no saved checkpoint), the worker re-reads from seq 0:
+      // the entire history. This costs processing time but ensures no changes
+      // are missed—especially reservations that arrived before the listener
+      // was deployed. Duplicates are prevented by durable doc markers
+      // (scheduledEmailSentAt, occupiedEmailSentAt), not by memory.
       feedWorker = createChangesFeedWorker<ReservationDoc>({
         db: reservationsDb,
         logger,
@@ -194,22 +236,8 @@ export function createReservationsListener(
               const currentStatus = doc.status;
               const isNewDocument = doc._rev?.startsWith("1-");
 
-              // Track status for occupied transitions
-              const prevStatus = previousStatus.get(change.id);
-              if (currentStatus) {
-                previousStatus.set(change.id, currentStatus);
-              }
-
-              cleanupPreviousStatusIfNeeded();
-
-              // Handle transition to "occupied" state
-              const isOccupiedTransition =
-                currentStatus === "occupied" &&
-                prevStatus &&
-                prevStatus !== "occupied" &&
-                !doc.occupiedEmailSentAt;
-
-              if (isOccupiedTransition) {
+              // Handle occupied reservation (by document state, not in-memory transition)
+              if (currentStatus === "occupied" && !doc.occupiedEmailSentAt) {
                 await handleOccupiedTransition(doc);
               }
 
@@ -229,7 +257,6 @@ export function createReservationsListener(
             }
           } else if (change.deleted) {
             logger.info(`[Notifications] Reservation deleted: ${change.id}`);
-            previousStatus.delete(change.id);
           }
         },
       });
@@ -256,7 +283,6 @@ export function createReservationsListener(
 
     logger.info("[Notifications] Stopping reservations listener...");
 
-    previousStatus.clear();
     processedReservations.clear();
     processedOccupiedReservations.clear();
 

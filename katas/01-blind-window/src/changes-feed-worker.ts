@@ -1,9 +1,17 @@
 import type { BaseDoc, ChangeRow, Database, Logger } from "./types";
 
+/** Checkpoint document structure. */
+interface Checkpoint {
+  _id: string;
+  lastSeq: string | number;
+}
+
 /** Delay between changes-feed polls (also the delay before the first one). */
 export const DEFAULT_CHANGES_POLL_INTERVAL_MS = 5_000;
 /** Max changes fetched per poll. */
 export const DEFAULT_CHANGES_BATCH_LIMIT = 100;
+/** Offset to re-deliver last change from previous batch. */
+export const CHECKPOINT_OFFSET = 1;
 
 export interface ChangesFeedWorkerDeps<T extends BaseDoc> {
   db: Database<T>;
@@ -20,10 +28,12 @@ export interface ChangesFeedWorkerDeps<T extends BaseDoc> {
   limit?: number;
   includeDocs?: boolean;
   /**
-   * Checkpoint to start from. Default: the database's `update_seq` at
-   * `start()`, so history is never re-processed. The checkpoint lives in
-   * memory — a restart resumes from the then-current seq, same as the
-   * pre-extraction listeners.
+   * Checkpoint to start from. Default: tries to recover a persisted
+   * checkpoint from the DB; if none exists (first startup), starts from
+   * seq 0 to re-read the full history. This ensures no changes are missed,
+   * but incurs a cost on first startup: every prior change is processed.
+   * Consumers must rely on durable doc state to avoid duplicates, not on
+   * in-memory checkpoints.
    */
   initialSince?: string | number;
 }
@@ -56,6 +66,34 @@ export function createChangesFeedWorker<T extends BaseDoc>(
   let lastSeq: string | number = 0;
   let pollTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  function getCheckpointId(): string {
+    return `_local/changes-feed-checkpoint:${logPrefix}`;
+  }
+
+  async function saveCheckpoint(seq: string | number): Promise<void> {
+    try {
+      try {
+        const checkpoint = await db.get(getCheckpointId());
+        await db.put({
+          ...checkpoint,
+          lastSeq: seq,
+        });
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        if (status === 404) {
+          await db.put({
+            _id: getCheckpointId(),
+            lastSeq: seq,
+          } as Checkpoint);
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      logger.error(`${logPrefix} Failed to save checkpoint: ${err}`);
+    }
+  }
+
   async function poll(): Promise<void> {
     if (!active) return;
     try {
@@ -69,8 +107,10 @@ export function createChangesFeedWorker<T extends BaseDoc>(
         logger.debug(`${logPrefix} Polled ${changes.results.length} change(s)`);
       }
 
+      let processedCount = 0;
       for (const change of changes.results) {
-        if (change.id.startsWith("_design/")) continue;
+        if (change.id.startsWith("_design/") || change.id.startsWith("_local/")) continue;
+        processedCount++;
         try {
           await onChange(change);
         } catch (err) {
@@ -81,7 +121,16 @@ export function createChangesFeedWorker<T extends BaseDoc>(
         }
       }
 
-      lastSeq = changes.last_seq;
+      // Update lastSeq and save checkpoint only if we processed real changes
+      if (processedCount > 0) {
+        lastSeq = changes.last_seq;
+        // Save checkpoint without blocking poll
+        saveCheckpoint(changes.last_seq).catch((err) => {
+          logger.error(
+            `${logPrefix} Unexpected error saving checkpoint: ${err}`,
+          );
+        });
+      }
     } catch (err) {
       logger.error(`${logPrefix} Error polling changes feed`, err);
     }
@@ -102,8 +151,31 @@ export function createChangesFeedWorker<T extends BaseDoc>(
     if (initialSince !== undefined) {
       lastSeq = initialSince;
     } else {
-      const info = await db.info();
-      lastSeq = info.update_seq;
+      try {
+        // Try to recover saved checkpoint
+        const checkpoint = await db.get(getCheckpointId()) as Checkpoint;
+        const checkpointSeq = checkpoint.lastSeq;
+        // Subtract CHECKPOINT_OFFSET to re-deliver the last change from previous batch
+        lastSeq = typeof checkpointSeq === "number"
+          ? Math.max(0, checkpointSeq - CHECKPOINT_OFFSET)
+          : 0;
+        logger.debug(
+          `${logPrefix} Recovered checkpoint from database: ${lastSeq}`,
+        );
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        if (status === 404) {
+          // No checkpoint: start from seq 0 to process all history.
+          // This ensures no changes are lost, even those created before
+          // the first startup. Cost: slow first startup (re-reads entire DB).
+          lastSeq = 0;
+          logger.debug(
+            `${logPrefix} No checkpoint found, starting from seq: 0 (reading full history)`,
+          );
+        } else {
+          throw err;
+        }
+      }
     }
     logger.info(
       `${logPrefix} Changes feed polling from seq: ${lastSeq} (every ${pollIntervalMs}ms)`,
